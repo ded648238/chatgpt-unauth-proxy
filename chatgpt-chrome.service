@@ -1,0 +1,14 @@
+[Unit]
+Description=Headless Chrome with CDP for ChatGPT proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/chatgpt-api-proxy/chrome-supervisor.sh
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=ChatGPT unauth API proxy
+After=network.target
+Wants=chatgpt-chrome.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/chatgpt-api-proxy
+Environment=PROXY_PORT=22050
+Environment=CDP_URL=http://127.0.0.1:9222
+Environment=MAX_QUEUE=20
+Environment=REQUEST_TIMEOUT=180
+Environment=COMPLETION_IDLE_MS=3200
+ExecStart=/usr/bin/node /root/chatgpt-api-proxy/server.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/opencode/proxy.log
+StandardError=append:/tmp/opencode/proxy.log
+# песочница не нужна, но изоляция от session scope нужна
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
