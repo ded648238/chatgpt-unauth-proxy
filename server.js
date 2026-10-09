@@ -72,7 +72,7 @@ function readBody(req) {
 }
 
 function flattenMessages(messages) {
-  // Склеиваем system/user/assistant в один текстовый промпт для веб-интерфейса.
+  // Склеиваем system/user/assistant/tool в один текстовый промпт для веб-интерфейса.
   const parts = [];
   for (const m of messages || []) {
     const role = m.role || 'user';
@@ -80,9 +80,22 @@ function flattenMessages(messages) {
     if (typeof m.content === 'string') text = m.content;
     else if (Array.isArray(m.content)) {
       text = m.content
-        .filter((c) => c && (c.type === 'text' || typeof c === 'string'))
-        .map((c) => (typeof c === 'string' ? c : c.text))
+        .filter((c) => c && (c.type === 'text' || c.type === 'input_text' || typeof c === 'string'))
+        .map((c) => (typeof c === 'string' ? c : (c.text || '')))
         .join('\n');
+    }
+    if (role === 'tool') {
+      const name = m.name || 'tool';
+      if (text) parts.push(`[tool ${name} result] ${text}`);
+      continue;
+    }
+    if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length && !text) {
+      const calls = m.tool_calls.map((t) => {
+        const fn = t.function || {};
+        return `${fn.name || t.name}(${fn.arguments || '{}'})`;
+      }).join('; ');
+      parts.push(`[assistant] (called tools: ${calls})`);
+      continue;
     }
     if (!text) continue;
     if (role === 'system' || role === 'developer') {
@@ -94,6 +107,95 @@ function flattenMessages(messages) {
     }
   }
   return parts.join('\n\n');
+}
+
+// ---------- homemade tools ----------
+
+function buildToolsPrompt(tools) {
+  const defs = (tools || [])
+    .filter((t) => t && (t.type === 'function' || t.function) && (t.function || {}).name)
+    .map((t) => {
+      const fn = t.function || {};
+      return `- ${fn.name}: ${fn.description || 'no description'}\n  parameters JSON schema: ${JSON.stringify(fn.parameters || { type: 'object', properties: {} })}`;
+    });
+  if (!defs.length) return '';
+  return [
+    '[system] You have access to the following tools. When the user request needs one,',
+    'call it by emitting EXACTLY one fenced block like this and nothing else outside it.',
+    'The opening fence must be exactly ```toolcall (three backticks + the word toolcall).',
+    'Bare JSON without the fence is NOT a valid call.',
+    '',
+    '```toolcall',
+    '{"name": "<tool-name>", "arguments": {<args as JSON object>}}',
+    '```',
+    '',
+    'Rules: output ONLY the fenced block when calling a tool (no prose before/after).',
+    'If no tool is needed, answer normally in plain text without any fenced block.',
+    'Available tools:',
+    ...defs,
+  ].join('\n');
+}
+
+function parseToolCalls(text, tools) {
+  const names = new Set(
+    (tools || [])
+      .filter((t) => t && (t.type === 'function' || t.function))
+      .map((t) => (t.function || {}).name)
+      .filter(Boolean),
+  );
+  const found = [];
+  const re = /```toolcall\s*([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(text || '')) !== null) {
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj && typeof obj.name === 'string' && names.has(obj.name)) {
+        found.push({
+          id: 'call_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'function',
+          function: {
+            name: obj.name,
+            arguments: typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments || {}),
+          },
+        });
+      }
+    } catch {}
+  }
+  if (!found.length) {
+    // fallback: bare JSON {"name": ..., "arguments": {...}} anywhere in text
+    const re2 = /\{\s*"name"\s*:\s*"([A-Za-z0-9_-]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+    let m2;
+    while ((m2 = re2.exec(text || '')) !== null) {
+      if (names.has(m2[1])) {
+        try {
+          JSON.parse(m2[2]);
+          found.push({
+            id: 'call_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+            type: 'function',
+            function: { name: m2[1], arguments: m2[2] },
+          });
+        } catch {}
+      }
+    }
+  }
+  return found;
+}
+
+function completionObjectWithTools(id, model, content, toolCalls) {
+  const msg = { role: 'assistant', content: content || null };
+  if (toolCalls && toolCalls.length) msg.tool_calls = toolCalls;
+  return {
+    id,
+    object: 'chat.completion',
+    created: now(),
+    model,
+    choices: [{
+      index: 0,
+      message: msg,
+      finish_reason: toolCalls && toolCalls.length ? 'tool_calls' : 'stop',
+    }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
 }
 
 // ---------- browser engine ----------
@@ -151,8 +253,10 @@ class Engine {
       const result = await this.runJob(next.job);
       next.resolve(result);
     } catch (e) {
-      // Разовый ретрай после переподключения: сломался браузер/вкладка.
+      // Браузер мог быть перезапущен (recycle/таймер). Ждём подъёма CDP и
+      // повторяем запрос — клиент не должен видеть 502 при плановом рестарте.
       try {
+        await this.waitForBrowser(60);
         this.ready = false;
         await this.connect();
         await this.driver.warmup();
@@ -170,12 +274,43 @@ class Engine {
     }
   }
 
+  // waitForBrowser: ждёт, пока CDP-эндпоинт снова начнёт отвечать.
+  async waitForBrowser(maxSec) {
+    const deadline = Date.now() + maxSec * 1000;
+    while (Date.now() < deadline) {
+      try {
+        const resp = await fetch(CDP + '/json/version');
+        if (resp.ok) return;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error('browser did not come up in ' + maxSec + 's');
+  }
+
   async runJob(job) {
     const { prompt, onDelta } = job;
     await this.driver.warmupOnce();
     const full = await this.driver.ask(prompt, onDelta, { timeout: REQUEST_TIMEOUT, idleMs: COMPLETION_IDLE_MS });
     return full;
   }
+}
+
+// withTimeout: ограничивает любой промис. Playwright не всегда обрывает
+// мёртвый CDP-сокет при падении Chrome — без обёртки запрос виснет навсегда.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + ' timeout after ' + ms + 'ms')), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+// withDeadline: гонка промиса с绝对ным таймаутом, после которого двигателю
+// ставится признак «браузер умер», чтобы pump пошёл в переподключение.
+async function withDeadline(promise, ms, label) {
+  return withTimeout(promise, ms, label);
 }
 
 // ---------- engine singleton ----------
@@ -204,7 +339,14 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const prompt = flattenMessages(messages);
+  // homemade tools: описываем тулсы системной инструкцией, вызовы парсим из ответа
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  const toolChoice = payload.tool_choice;
+  const wantTools = tools.length > 0 && toolChoice !== 'none';
+  const toolsPrompt = wantTools ? buildToolsPrompt(tools) : '';
+
+  let prompt = flattenMessages(messages);
+  if (toolsPrompt) prompt = toolsPrompt + '\n\n' + prompt;
 
   if (stream) {
     res.writeHead(200, {
@@ -225,15 +367,28 @@ async function handleChatCompletions(req, res) {
     req.on('close', () => { closed = true; });
 
     try {
+      let acc = '';
       await engine.submit({
         prompt,
         onDelta: (delta) => {
-          if (closed) return;
+          acc += delta;
+          if (closed || wantTools) return; // при тулсах дельты копим, решение — в конце
           writeSSE(completionChunk(id, model, { content: delta }, null));
         },
       });
       if (!closed) {
-        writeSSE(completionChunk(id, model, {}, 'stop'));
+        if (wantTools) {
+          const calls = parseToolCalls(acc, tools);
+          if (calls.length) {
+            writeSSE(completionChunk(id, model, { tool_calls: calls }, null));
+            writeSSE(completionChunk(id, model, {}, 'tool_calls'));
+          } else {
+            writeSSE(completionChunk(id, model, { content: acc }, null));
+            writeSSE(completionChunk(id, model, {}, 'stop'));
+          }
+        } else {
+          writeSSE(completionChunk(id, model, {}, 'stop'));
+        }
         res.write('data: [DONE]\n\n');
         res.end();
       }
@@ -250,6 +405,18 @@ async function handleChatCompletions(req, res) {
   // non-streaming
   try {
     const full = await engine.submit({ prompt, onDelta: () => {} });
+    if (wantTools) {
+      const calls = parseToolCalls(full, tools);
+      if (calls.length) {
+        // убираем служебный fenced-блок из видимого контента (с кавычками и без)
+        const clean = full
+          .replace(/```toolcall\s*[\s\S]*?```/g, '')
+          .replace(/^\s*toolcall\s*(\{[\s\S]*\})\s*$/m, '')
+          .trim();
+        sendJSON(res, 200, completionObjectWithTools(id, model, clean || null, calls));
+        return;
+      }
+    }
     sendJSON(res, 200, completionObject(id, model, full));
   } catch (e) {
     sendError(res, 502, 'ChatGPT request failed: ' + e.message, 'upstream_error');
